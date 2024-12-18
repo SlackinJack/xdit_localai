@@ -16,28 +16,26 @@ import torch.multiprocessing as mp
 from PIL import Image
 from flask import Flask, request, jsonify
 from xfuser import (
+    xFuserArgs,
+    xFuserFluxPipeline,
+    xFuserHunyuanDiTPipeline,
     xFuserPixArtAlphaPipeline,
     xFuserPixArtSigmaPipeline,
-    xFuserFluxPipeline,
     xFuserStableDiffusion3Pipeline,
-    xFuserHunyuanDiTPipeline,
-    xFuserArgs,
 )
 from xfuser.config import FlexibleArgumentParser
 from xfuser.core.distributed import (
-    get_world_group,
-    is_dp_last_group,
     get_data_parallel_world_size,
     get_runtime_state,
+    get_world_group,
+    is_dp_last_group,
 )
 
 app = Flask(__name__)
 
-# 设置 NCCL 超时和错误处理
 os.environ["NCCL_BLOCKING_WAIT"] = "1"
 os.environ["NCCL_ASYNC_ERROR_HANDLING"] = "1"
 
-# 全局变量
 pipe = None
 engine_config = None
 input_config = None
@@ -85,6 +83,7 @@ def initialize():
     global extended_args
     extended_args = {}
     parser.add_argument("--variant", type=str, default="fp16", help="PyTorch variant [fp16/fp32]")
+    parser.add_argument("--pipeline_type", type=str, default=None, help="Pipeline type")
     # parser.add_argument("--compel", action="store_true", help="Enable Compel")
     # parser.add_argument("--scheduler", type=str, default="dpmpp_2m", help="Pipeline scheduler")
     extended_parser, xparser_args = parser.parse_known_args()
@@ -93,6 +92,11 @@ def initialize():
     if extended_parser.variant is not None:
         extended_args["variant"] = extended_parser.variant
         remove_extended_arg(parser, "variant")
+    if extended_parser.pipeline_type is not None:
+        extended_args["pipeline_type"] = extended_parser.pipeline_type
+        remove_extended_arg(parser, "pipeline_type")
+    else:
+        assert False, "Pipeline type must be defined"
     # if extended_parser.compel is not None:
     #     extended_args["compel"] = extended_parser.compel
     #     remove_extended_arg(parser, "compel")
@@ -109,19 +113,17 @@ def initialize():
     torch.cuda.set_device(local_rank)
     logger.info(f"Initializing model on GPU: {torch.cuda.current_device()}")
 
-    model_name = engine_config.model_config.model.split("/")[-1]
-
+    pipeline_type = extended_args["pipeline_type"]
     pipeline_map = {
-        "PixArt-XL-2-1024-MS": xFuserPixArtAlphaPipeline,
-        "PixArt-Sigma-XL-2-2K-MS": xFuserPixArtSigmaPipeline,
-        "stable-diffusion-3-medium-diffusers": xFuserStableDiffusion3Pipeline,
-        "HunyuanDiT-v1.2-Diffusers": xFuserHunyuanDiTPipeline,
-        "FLUX.1-schnell": xFuserFluxPipeline,
+        "flux":         xFuserFluxPipeline,
+        "hy":           xFuserHunyuanDiTPipeline,
+        "pixart_alpha": xFuserPixArtAlphaPipeline,
+        "pixart_sigma": xFuserPixArtSigmaPipeline,
+        "sd3":          xFuserStableDiffusion3Pipeline,
     }
-
-    PipelineClass = pipeline_map.get(model_name)
+    PipelineClass = pipeline_map.get(pipeline_type)
     if PipelineClass is None:
-        raise NotImplementedError(f"{model_name} is currently not supported!")
+        raise NotImplementedError(f"{pipeline_type} pipeline type not found")
 
     # scheduler = None
     # match extended_args["scheduler"]:
@@ -136,15 +138,16 @@ def initialize():
         engine_config=engine_config,
         torch_dtype=torch.float16 if extended_args['variant'] == "fp16" else torch.float32,
         # scheduler=scheduler,
+        use_safetensors=True,
     ).to(f"cuda:{local_rank}")
 
     pipe.prepare_run(input_config)
     logger.info("Model initialization completed")
-    initialized = True  # 设置初始化完成标志
+    initialized = True
 
 
 def generate_image_parallel(
-    positive_prompt, negative_prompt, num_inference_steps, seed, cfg, save_disk_path=None
+    positive_prompt, negative_prompt, num_inference_steps, seed, cfg, clip_skip
 ):
     global pipe, local_rank, input_config
     logger.info(f"Starting image generation with prompt: {positive_prompt}")
@@ -164,7 +167,7 @@ def generate_image_parallel(
     #         requires_pooled=[False, True],
     #     )
     #     positive_embeds, positive_pooled_embeds = compel([positive_prompt])
-    #     if len(negative_prompt) > 0:
+    #     if negative_prompt and len(negative_prompt) > 0:
     #         negative_embeds, negative_pooled_embeds = compel([negative_prompt])
 
     output = pipe(
@@ -176,6 +179,7 @@ def generate_image_parallel(
         output_type="pil",
         generator=torch.Generator(device=f"cuda:{local_rank}").manual_seed(seed),
         guidance_scale=cfg,
+        clip_skip=clip_skip,
         prompt_embeds=positive_embeds,
         pooled_prompt_embeds=positive_pooled_embeds,
         negative_embeds=negative_embeds,
@@ -185,42 +189,25 @@ def generate_image_parallel(
     elapsed_time = end_time - start_time
     logger.info(f"Image generation completed in {elapsed_time:.2f} seconds")
 
-    if save_disk_path is not None:
-        timestamp = time.strftime("%Y%m%d-%H%M%S")
-        filename = f"generated_image_{timestamp}.png"
-        file_path = os.path.join(save_disk_path, filename)
-        if is_dp_last_group():
-            # Create the directory if it doesn't exist
-            os.makedirs(save_disk_path, exist_ok=True)
-            # Save the image to the specified directory
-            output.images[0].save(file_path)
-            logger.info(f"Image saved to: {file_path}")
+    if is_dp_last_group():
+        # serialize output object
+        output_bytes = pickle.dumps(output)
 
-        output = file_path
-    else:
-        if is_dp_last_group():
-            # serialize output object
-            output_bytes = pickle.dumps(output)
+        # send output to rank 0
+        dist.send(torch.tensor(len(output_bytes), device=f"cuda:{local_rank}"), dst=0)
+        dist.send(torch.ByteTensor(list(output_bytes)).to(f"cuda:{local_rank}"), dst=0)
 
-            # send output to rank 0
-            dist.send(
-                torch.tensor(len(output_bytes), device=f"cuda:{local_rank}"), dst=0
-            )
-            dist.send(
-                torch.ByteTensor(list(output_bytes)).to(f"cuda:{local_rank}"), dst=0
-            )
+        logger.info(f"Output sent to rank 0")
 
-            logger.info(f"Output sent to rank 0")
+    if dist.get_rank() == 0:
+        # recv from rank world_size - 1
+        size = torch.tensor(0, device=f"cuda:{local_rank}")
+        dist.recv(size, src=dist.get_world_size() - 1)
+        output_bytes = torch.ByteTensor(size.item()).to(f"cuda:{local_rank}")
+        dist.recv(output_bytes, src=dist.get_world_size() - 1)
 
-        if dist.get_rank() == 0:
-            # recv from rank world_size - 1
-            size = torch.tensor(0, device=f"cuda:{local_rank}")
-            dist.recv(size, src=dist.get_world_size() - 1)
-            output_bytes = torch.ByteTensor(size.item()).to(f"cuda:{local_rank}")
-            dist.recv(output_bytes, src=dist.get_world_size() - 1)
-
-            # deserialize output object
-            output = pickle.loads(output_bytes.cpu().numpy().tobytes())
+        # deserialize output object
+        output = pickle.loads(output_bytes.cpu().numpy().tobytes())
 
     return output, elapsed_time
 
@@ -229,58 +216,42 @@ def generate_image_parallel(
 def generate_image():
     logger.info("Received POST request for image generation")
     data = request.json
-    positive_prompt = data.get("positive_prompt", input_config.prompt)
-    negative_prompt = data.get("negative_prompt", "")
-    num_inference_steps = data.get(
-        "num_inference_steps", input_config.num_inference_steps
-    )
-    seed = data.get("seed", input_config.seed)
-    cfg = data.get("cfg", 8.0)
-    save_disk_path = data.get("save_disk_path")
-
-    # Check if save_disk_path is valid, if not, set it to a default directory
-    if save_disk_path:
-        if not os.path.isdir(save_disk_path):
-            default_path = os.path.join(os.path.expanduser("~"), "tacodit_output")
-            os.makedirs(default_path, exist_ok=True)
-            logger.warning(
-                f"Invalid save_disk_path. Using default path: {default_path}"
-            )
-            save_disk_path = default_path
-    else:
-        save_disk_path = None
+    positive_prompt     = data.get("positive_prompt", None)
+    negative_prompt     = data.get("negative_prompt", None)
+    num_inference_steps = data.get("num_inference_steps", 30)
+    seed                = data.get("seed", 1)
+    cfg                 = data.get("cfg", 3.5)
+    clip_skip           = data.get("clip_skip", 0)
 
     logger.info(
-        f"Request parameters: positive_prompt='{positive_prompt}', negative_prompt='{negative_prompt}', steps={num_inference_steps}, seed={seed}, cfg={cfg}, save_disk_path={save_disk_path}"
+        "Request parameters:\n"
+        f"positive_prompt='{positive_prompt}'\n"
+        f"negative_prompt='{negative_prompt}'\n"
+        f"steps={num_inference_steps}\n"
+        f"seed={seed}\n"
+        f"cfg={cfg}\n"
+        f"clip_skip={clip_skip}"
     )
     # Broadcast request parameters to all processes
-    params = [positive_prompt, negative_prompt, num_inference_steps, seed, cfg, save_disk_path]
+    params = [positive_prompt, negative_prompt, num_inference_steps, seed, cfg, clip_skip]
     dist.broadcast_object_list(params, src=0)
     logger.info("Parameters broadcasted to all processes")
 
     output, elapsed_time = generate_image_parallel(*params)
 
-    if save_disk_path:
-        # output is a disk path
-        output_base64 = ""
-        image_path = save_disk_path
+    # Ensure output is not None before accessing its attributes
+    if output and hasattr(output, "images") and output.images:
+        pickled_image = pickle.dumps(output)
+        output_base64 = base64.b64encode(pickled_image).decode('utf-8')
     else:
-        # Ensure output is not None before accessing its attributes
-        if output and hasattr(output, "images") and output.images:
-            pickled_image = pickle.dumps(output)
-            output_base64 = base64.b64encode(pickled_image).decode('utf-8')
-        else:
-            output_base64 = ""
-        image_path = ""
+        output_base64 = ""
+    image_path = ""
 
     response = {
         "message": "Image generated successfully",
         "elapsed_time": f"{elapsed_time:.2f} sec",
-        "output": output_base64 if not save_disk_path else output,
-        "save_to_disk": save_disk_path is not None,
+        "output": output_base64,
     }
-
-    # logger.info(f"Sending response: {response}")
     return jsonify(response)
 
 
@@ -290,8 +261,7 @@ def run_host():
         app.run(host="0.0.0.0", port=6000)
     else:
         while True:
-            # 非主进程等待广播的参数
-            params = [None] * 5
+            params = [None] * 6 # len(params) of generate_image_parallel()
             logger.info(f"Rank {dist.get_rank()} waiting for tasks")
             dist.broadcast_object_list(params, src=0)
             if params[0] is None:
@@ -301,15 +271,6 @@ def run_host():
             generate_image_parallel(*params)
 
 
-# curl -X POST http://127.0.0.1:6000/generate \
-#      -H "Content-Type: application/json" \
-#      -d '{
-#            "prompt": "A lovely rabbit",
-#            "num_inference_steps": 50,
-#            "seed": 42,
-#            "cfg": 7.5,
-#            "save_disk_path": true
-#          }'
 if __name__ == "__main__":
     initialize()
 
