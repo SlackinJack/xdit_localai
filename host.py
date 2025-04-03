@@ -155,10 +155,10 @@ def generate_image_parallel(
     torch.cuda.reset_peak_memory_stats()
     start_time = time.time()
 
-    positive_embeds = None
-    positive_pooled_embeds = None
-    negative_embeds = None
-    negative_pooled_embeds = None
+    # positive_embeds = None
+    # positive_pooled_embeds = None
+    # negative_embeds = None
+    # negative_pooled_embeds = None
     # if extended_args['compel']:
     #     compel = Compel(
     #         tokenizer=[pipe.tokenizer, pipe.tokenizer_2],
@@ -173,17 +173,17 @@ def generate_image_parallel(
     output = pipe(
         height=input_config.height,
         width=input_config.width,
-        prompt=positive_prompt if positive_embeds is None else None,
-        negative_prompt=negative_prompt if negative_embeds is None else None,
+        prompt=positive_prompt, # if positive_embeds is None else None,
+        negative_prompt=negative_prompt, # if negative_embeds is None else None,
         num_inference_steps=num_inference_steps,
         output_type="pil",
         generator=torch.Generator(device=f"cuda:{local_rank}").manual_seed(seed),
         guidance_scale=cfg,
         clip_skip=clip_skip,
-        prompt_embeds=positive_embeds,
-        pooled_prompt_embeds=positive_pooled_embeds,
-        negative_embeds=negative_embeds,
-        negative_pooled_embeds=negative_pooled_embeds,
+        # prompt_embeds=positive_embeds,
+        # pooled_prompt_embeds=positive_pooled_embeds,
+        # negative_embeds=negative_embeds,
+        # negative_pooled_embeds=negative_pooled_embeds,
     )
     end_time = time.time()
     elapsed_time = end_time - start_time
